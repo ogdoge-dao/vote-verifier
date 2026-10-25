@@ -1,0 +1,22 @@
+"""Program ids and fixed protocol strings."""
+
+SYSTEM_PROGRAM = "11111111111111111111111111111111"
+TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+ASSOCIATED_TOKEN_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+COMPUTE_BUDGET_PROGRAM = "ComputeBudget111111111111111111111111111111"
+MEMO_V1 = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo"
+MEMO_V2 = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+
+DEFAULT_MINT = "utLyQQCPvjuCc6zeaXdsFeEC3JNdxKS3vxaZWoGdoge"
+DECIMALS = 6
+RENT_MIN_LAMPORTS = 650_240          # 0-byte system account, measured 2026-10-24
+BASE_FEE_LAMPORTS = 5_000
+LAMPORTS_PER_SOL = 1_000_000_000
+
+# Programs a wallet may add to a plain transfer (fill in after the wallet test matrix).
+EXTRA_ALLOWED_PROGRAMS: frozenset[str] = frozenset()
+
+MEMO_VOTE = "OGDOGE-VOTE"
+MEMO_REFUND = "OGDOGE-REFUND"
+MEMO_ANCHOR = "OGDOGE-DAO"
+REQUEST_MIN_BALANCE = 100_000 * 10**DECIMALS
