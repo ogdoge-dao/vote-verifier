@@ -8,6 +8,10 @@ tally from the package files alone (independent of the server code), and prints 
 With --rpc it also re-fetches every vote transaction and re-runs the deposit validator, and confirms that
 every anchor marked as sent is on Solana with the same memo, paid by one wallet (--notary pins which).
 Exit code 0 when every check passes. Needs Python 3.10+, base58 and solders; nothing else from the server.
+
+Voting power: each wallet counts its balance in the eligibility snapshot, but never more than its lowest balance in
+the balance checks of the vote's holding period (rules.hold_hours: the last hours before the close; a period as
+long as the vote counts every check). Rules published before the holding period existed count every check.
 """
 
 from __future__ import annotations
@@ -30,12 +34,17 @@ from typing import Any
 import base58
 from solders.pubkey import Pubkey
 
+__version__ = "1.1.0"
 GENESIS = "0" * 64
 ANCHOR = "OGDOGE-DAO|v1"
 MEMO_PROGRAMS = {"Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo", "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"}
 # Tally keys added with rules.min_voters; tallies anchored before that have none of them.
 MIN_VOTERS_KEYS = ("quorum_power_reached", "min_voters", "min_voters_reached")
 INT_COLS = {"option", "created_at", "lamports", "slot", "block_time", "valid", "superseded", "added_at", "id"}
+# With --rpc, the recorded start of a holding period may be at most this many slots (about a minute) before the
+# first block made after its start time.
+HOLD_SLACK_SLOTS = 150
+HOLD_SEARCH_SLOTS = 10_000      # how far to look for the next block when the chain made none in that minute
 
 
 class Fail(Exception):
@@ -116,17 +125,60 @@ def content_hash(p: dict) -> str:
     return sha256_hex(canonical_json({k: p[k] for k in keys}).encode())
 
 
+def hold_hours(pkg: Package) -> int | None:
+    """rules.hold_hours: the holding period, in hours before the close. None for rules published before it existed
+    (the content hash covers rules, so this can't be faked): every check since the open counts."""
+    rules = pkg.proposal["rules"]
+    if "hold_hours" not in rules:
+        return None
+    hours = rules["hold_hours"]
+    if type(hours) is not int or type(rules.get("duration_hours")) is not int or not 1 <= hours <= rules["duration_hours"]:
+        raise Fail(f"rules.hold_hours is not a whole number from 1 to the vote's length: {hours!r}")
+    return hours
+
+
+def hold_entry(pkg: Package) -> dict | None:
+    """The hash chain entry that fixed where the holding period starts (at most one), or None before it."""
+    p = pkg.proposal
+    found = [e for e in pkg.logged("proposal") if e["id"] == p["id"] and e["action"] == "hold"]
+    if len(found) > 1:
+        raise Fail(f"{len(found)} hold entries in the hash chain")
+    return found[0] if found else None
+
+
+def hold_slot(pkg: Package) -> int | None:
+    """Slot the holding period starts at, as recorded in the hash chain (proposal.json must agree).
+
+    The hash-chained entry decides: proposal.json alone is not covered by any hash, so editing its hold_slot must
+    not move the holding period.
+    """
+    entry = hold_entry(pkg)
+    slot = entry.get("hold_slot") if entry else None
+    if slot != pkg.proposal.get("hold_slot"):
+        raise Fail(f"proposal.json hold_slot {pkg.proposal.get('hold_slot')} != hold entry {slot}")
+    if slot is not None and type(slot) is not int:
+        raise Fail(f"hold_slot is not a slot number: {slot!r}")
+    return slot
+
+
 def counted_snapshots(pkg: Package) -> list[int]:
     p = pkg.proposal
     if p.get("elig_snapshot_id") is None:
         return []
     later = [s["id"] for s in pkg.snapshots if s["proposal_id"] == p["id"] and s["kind"] in ("check", "final")
              and p["open_slot"] is not None and s["slot"] >= p["open_slot"]]
+    if hold_hours(pkg) is not None:
+        # Only the checks of the holding period count; until one exists, the latest check alone (provisional).
+        slots = {s["id"]: s["slot"] for s in pkg.snapshots}
+        later.sort(key=lambda i: (slots[i], i))
+        start = hold_slot(pkg)
+        inside = [i for i in later if start is not None and slots[i] >= start]
+        later = inside or later[-1:]
     return [p["elig_snapshot_id"], *later]
 
 
-def wallet_power(pkg: Package, wallet: str) -> int:
-    ids = counted_snapshots(pkg)
+def wallet_power(pkg: Package, wallet: str, ids: list[int] | None = None) -> int:
+    ids = counted_snapshots(pkg) if ids is None else ids
     return min((pkg.balances[i].get(wallet, 0) for i in ids), default=0)
 
 
@@ -161,10 +213,11 @@ def _tally(pkg: Package) -> tuple[dict, int]:
     elig = pkg.balances.get(p["elig_snapshot_id"], {})
     options = [{"name": n, "power": 0, "wallets": 0} for n in names]
     voters, counted, lost = 0, 0, 0
+    snapshot_ids = counted_snapshots(pkg)
     for wallet, v in sorted(current_votes(pkg).items()):
         if wallet in excluded or not 0 <= v["option"] < len(names) or not in_window(p, v["slot"]):
             continue
-        w = wallet_power(pkg, wallet)
+        w = wallet_power(pkg, wallet, snapshot_ids)
         options[v["option"]]["power"] += w
         options[v["option"]]["wallets"] += 1
         counted += 1
@@ -255,6 +308,58 @@ def check_exclusions(pkg: Package) -> str:
     _expect(any(a["kind"] == "exclusions" and a["ref"] == p["id"] and a["memo"] == memo for a in pkg.anchors),
             "no exclusions anchor with this hash")
     return f"{len(rows)} addresses, hash {h[:16]}"
+
+
+def hold_at(pkg: Package, hours: int) -> int:
+    """When the holding period starts: `hours` before the close, never before the open."""
+    p = pkg.proposal
+    return max(p["open_at"], p["close_at"] - hours * 3600)
+
+
+def check_holding_period(pkg: Package) -> str:
+    """The holding period of the rules, and the slot it starts at as the hash chain recorded it."""
+    p, hours = pkg.proposal, hold_hours(pkg)
+    if hours is None:
+        return "rules from before the holding period existed: every check since the open counts"
+    slot, at = hold_slot(pkg), hold_at(pkg, hours)
+    whole = hours == p["rules"]["duration_hours"]
+    name = "the whole vote" if whole else f"the last {hours} h before the close"
+    checks = [s for s in pkg.snapshots if s["proposal_id"] == p["id"] and s["kind"] in ("check", "final")]
+    if slot is None:
+        _expect(p.get("close_slot") is None and not any(s["kind"] == "final" for s in checks),
+                "the vote closed, but the hash chain has no hold entry")
+        return f"{name}; not started when this package was made: power is provisional"
+    _expect(hold_entry(pkg).get("hold_at") == at, f"hold entry starts at {hold_entry(pkg).get('hold_at')}, not {at}")
+    _expect(type(p.get("open_slot")) is int and slot >= p["open_slot"], f"hold slot {slot} is before the open slot")
+    if whole:
+        _expect(slot == p["open_slot"], f"a holding period as long as the vote starts at the open slot, not {slot}")
+    close = p.get("close_slot")
+    _expect(close is None or slot <= max(close, p["open_slot"]), f"hold slot {slot} is after the close slot {close}")
+    counted = max(0, len(counted_snapshots(pkg)) - 1)      # without the eligibility snapshot, which always counts
+    if whole:
+        return f"{name}, from slot {slot} (the open slot): {counted} of {len(checks)} checks count"
+    agree = _votes_agree_with_hold(pkg, slot, at)
+    return (f"{name}, from slot {slot} as logged (the block times of {agree} votes agree; --rpc checks it on Solana): "
+            f"{counted} of {len(checks)} checks count")
+
+
+def _votes_agree_with_hold(pkg: Package, slot: int, at: int) -> int:
+    """Checks the recorded hold slot against the block times of the package's votes, without a network: a vote in a
+    slot up to it was not made after the period's start time (unless the period starts at the open slot, for a vote
+    opened after that time), and a vote more than HOLD_SLACK_SLOTS after it was. Returns how many votes had a time."""
+    seen = 0
+    for v in pkg.votes:
+        s, t = v.get("slot"), v.get("block_time")
+        if type(s) is not int or type(t) is not int:
+            continue
+        seen += 1
+        if s <= slot and slot != pkg.proposal["open_slot"]:
+            _expect(t <= at, f"vote {v['signature']} (slot {s}, time {t}) was made after the start {at}, yet its slot is "
+                             f"not after hold slot {slot}: the slot is too late")
+        if s > slot + HOLD_SLACK_SLOTS:
+            _expect(t > at, f"vote {v['signature']} (slot {s}, time {t}) was not made after the start {at}, yet its slot "
+                            f"is well after hold slot {slot}: the slot is too early")
+    return seen
 
 
 def check_content_hash(pkg: Package) -> str:
@@ -376,7 +481,7 @@ def check_tally_anchor(pkg: Package) -> str:
 
 CHECKS: list[tuple[str, Callable[[Package], str]]] = [
     ("content_hash", check_content_hash), ("hash_chain", check_hash_chain), ("publish", check_publish),
-    ("exclusions", check_exclusions),
+    ("exclusions", check_exclusions), ("holding_period", check_holding_period),
     ("snapshots", check_snapshots), ("sessions", check_sessions), ("deposits", check_deposits),
     ("votes", check_votes), ("tally", check_tally), ("tally_anchor", check_tally_anchor),
 ]
@@ -485,6 +590,47 @@ def check_rpc_anchors(pkg: Package, url: str, notary: str | None = None) -> str:
     return f"{len(sent)} anchors found on Solana, paid by {next(iter(payers), '-')}"
 
 
+def _block_time(url: str, slot: int) -> int:
+    t = _rpc_call(url, "getBlockTime", [slot])
+    if isinstance(t, bool) or not isinstance(t, int):
+        raise Fail(f"the RPC has no block time for slot {slot}")
+    return t
+
+
+def _blocks(url: str, first: int, last: int) -> list[int]:
+    """Slots in [first, last] that hold a finalized block, ascending."""
+    found = _rpc_call(url, "getBlocks", [first, last, {"commitment": "finalized"}])
+    if not isinstance(found, list) or any(isinstance(b, bool) or not isinstance(b, int) for b in found):
+        raise ValueError("unexpected getBlocks response")
+    return sorted(b for b in found if first <= b <= last)
+
+
+def check_rpc_hold(pkg: Package, url: str) -> str:
+    """The slot the holding period starts at is, on Solana, the last block made up to its start time: its own block
+    is not later than that time, and the chain is past that time at most HOLD_SLACK_SLOTS later (so the server
+    could not shift the period to add or drop a balance check)."""
+    p, hours = pkg.proposal, hold_hours(pkg)
+    if hours is None:
+        return "rules from before the holding period existed: nothing to check"
+    slot = hold_slot(pkg)
+    if slot is None:
+        return "the holding period had not started when this package was made"
+    if hours == p["rules"]["duration_hours"]:
+        return "the whole vote: it starts at the open slot"
+    at = hold_at(pkg, hours)
+    if slot != p["open_slot"]:      # a vote opened after that time starts its holding period at its open slot
+        t = _block_time(url, slot)
+        _expect(t <= at, f"slot {slot} was made at {t}, after the holding period's start {at}")
+    near = _blocks(url, slot + 1, slot + HOLD_SLACK_SLOTS)
+    after = near[-1] if near else next(iter(_blocks(url, slot + HOLD_SLACK_SLOTS + 1, slot + HOLD_SEARCH_SLOTS)), None)
+    _expect(after is not None, f"no block found in the {HOLD_SEARCH_SLOTS} slots after {slot}: cannot confirm it")
+    t_after = _block_time(url, after)
+    _expect(t_after > at, f"slot {after} (time {t_after}) is still not after the start {at}: slot {slot} is too early")
+    if slot == p["open_slot"]:
+        return f"the vote opened after {at}: its holding period starts at its open slot {slot}"
+    return f"slot {slot} is the last block up to {at} (within {HOLD_SLACK_SLOTS} slots)"
+
+
 def _report(name: str, fn: Callable[[], str], out: list[bool]) -> None:
     try:
         detail = fn()
@@ -506,6 +652,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("zip")
     ap.add_argument("--rpc", help="Solana RPC URL to re-check every vote and every anchor on-chain")
     ap.add_argument("--notary", help="with --rpc: the notary wallet address the anchors must be paid by")
+    ap.add_argument("--version", action="version", version=f"OGDOGE DAO vote verifier {__version__}")
     args = ap.parse_args(argv)
     try:
         pkg = Package(args.zip)
@@ -518,6 +665,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.rpc:
         _report("rpc_votes", lambda: check_rpc(pkg, args.rpc), results)
         _report("rpc_anchors", lambda: check_rpc_anchors(pkg, args.rpc, args.notary), results)
+        _report("rpc_hold", lambda: check_rpc_hold(pkg, args.rpc), results)
     ok = all(results)
     print("RESULT: PASS" if ok else "RESULT: FAIL")
     return 0 if ok else 1
